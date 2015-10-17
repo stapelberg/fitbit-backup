@@ -11,7 +11,7 @@ to store weight data will be retrieved.
 To download and compile, use:
 
 ```bash
-go get github.com/stapelberg/fitbit-backup
+go get -u github.com/stapelberg/fitbit-backup
 ```
 
 Afterwards, run `$GOPATH/bin/fitbit-backup` to make sure it works (see below
@@ -35,15 +35,15 @@ https://dev.fitbit.com/apps/new and fill in the form like in this example:
 src="https://github.com/stapelberg/fitbit-backup/raw/master/fitbit_app_registration.png"
 width="800" alt="fitbit app registration screenshot">
 
-Afterwards, fitbit will present you two values for the newly created
-application: the “Client (Consumer) Key” and “Client (Consumer) Secret”.
-Specify those using the flags `-oauth_consumer_key` and
-`-oauth_consumer_secret`, respectively.
+Afterwards, fitbit will present you the “Client (Consumer) Secret” for the
+newly created application. Specify that using the flag `-oauth2_client_secret`.
 
 When running `fitbit-backup`, it will prompt you to visit a URL in your browser
 in order to authorize the application to access your personal Fitbit account.
-After doing that, it will generate an access token, which you need to pass by
-using the flags `-access_token_token` and `-access_token_secret`.
+Point the flag `-oauth2_cache_path` to a writable file and `fitbit-backup` will
+store the OAuth2 token in there. If you run `fitbit-backup` before the token
+expires, it will be automatically renewed. Ideally, you only have to visit the
+authorization URL in your browser once.
 
 That’s it — now, when running `fitbit-backup` with all required flags, you
 should get an output like this:

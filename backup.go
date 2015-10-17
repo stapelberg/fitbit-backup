@@ -1,56 +1,142 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
-	"github.com/mrjones/oauth"
+	"io/ioutil"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
+	"strings"
 	"time"
+
+	"golang.org/x/net/context"
+	"golang.org/x/oauth2"
 )
 
 var (
-	consumerKey = flag.String("oauth_consumer_key",
-		"",
-		"OAuth Client (Consumer) Key (see dev.fitbit.com)")
-	consumerSecret = flag.String("oauth_consumer_secret",
+	clientSecret = flag.String("oauth2_client_secret",
 		"",
 		"OAuth Client (Consumer) Secret (see dev.fitbit.com)")
-	accessTokenToken = flag.String("access_token_token",
+
+	cachePath = flag.String("oauth2_cache_path",
+		// No default value because expanding ~ is tricky.
 		"",
-		"OAuth AccessToken token part")
-	accessTokenSecret = flag.String("access_token_secret",
-		"",
-		"OAuth AccessToken secret part")
+		"Path to a JSON-encoded file which will contain the OAuth2 token")
 )
+
+// The following code is intentionally very similar to
+// camlistore.org/pkg/oauthutil, in the hope that it one day is included in the
+// Go standard library…
+
+// ErrNoAuthCode is returned when Token() has not found any valid cached token
+// and TokenSource does not have an AuthCode for getting a new token.
+var ErrNoAuthCode = errors.New("oauthutil: unspecified TokenSource.AuthCode")
+
+type FileTokenSource struct {
+	Config *oauth2.Config
+
+	CacheFile string
+
+	AuthCode func() string
+}
+
+var errExpiredToken = errors.New("expired token")
+
+func cachedToken(cacheFile string) (*oauth2.Token, error) {
+	tok := new(oauth2.Token)
+	tokenData, err := ioutil.ReadFile(cacheFile)
+	if err != nil {
+		return nil, err
+	}
+	if err := json.Unmarshal(tokenData, tok); err != nil {
+		return nil, err
+	}
+	if !tok.Valid() {
+		if tok != nil && time.Now().After(tok.Expiry) {
+			return nil, errExpiredToken
+		}
+		return nil, errors.New("invalid token")
+	}
+	return tok, nil
+}
+
+func (src FileTokenSource) Token() (*oauth2.Token, error) {
+	var tok *oauth2.Token
+	var err error
+	if src.CacheFile != "" {
+		tok, err = cachedToken(src.CacheFile)
+		if err == nil {
+			return tok, nil
+		}
+		if err != errExpiredToken {
+			log.Printf("Error getting token from %q: %v\n", src.CacheFile, err)
+		}
+	}
+	if src.AuthCode == nil {
+		return nil, ErrNoAuthCode
+	}
+	tok, err = src.Config.Exchange(oauth2.NoContext, src.AuthCode())
+	if err != nil {
+		return nil, fmt.Errorf("could not exchange auth code for a token: %v", err)
+	}
+	if src.CacheFile == "" {
+		return tok, nil
+	}
+	tokenData, err := json.Marshal(&tok)
+	if err != nil {
+		return nil, fmt.Errorf("could not encode token as json: %v", err)
+	}
+	if err := ioutil.WriteFile(src.CacheFile, tokenData, 0600); err != nil {
+		return nil, fmt.Errorf("could not cache token in %q: %v", src.CacheFile, err)
+	}
+	return tok, nil
+}
 
 func main() {
 	flag.Parse()
 
-	if *consumerKey == "" || *consumerSecret == "" {
-		log.Fatal("-oauth_consumer_key or -oauth_consumer_secret not specified. Register an app at http://dev.fitbit.com to get these.")
+	if *clientSecret == "" {
+		log.Fatal("-oauth2_client_secret not specified. Register an app at https://dev.fitbit.com to get one.")
 	}
 
-	c := oauth.NewConsumer(
-		*consumerKey,
-		*consumerSecret,
-		oauth.ServiceProvider{
-			RequestTokenUrl:   "https://api.fitbit.com/oauth/request_token",
-			AuthorizeTokenUrl: "https://www.fitbit.com/oauth/authorize",
-			AccessTokenUrl:    "https://api.fitbit.com/oauth/access_token",
-		})
-
-	c.AdditionalAuthorizationUrlParams = map[string]string{
-		"application_name":   "fitbit-backup",
-		"oauth_consumer_key": *consumerKey,
+	conf := &oauth2.Config{
+		ClientID:     "228XTZ",
+		ClientSecret: *clientSecret,
+		Scopes:       []string{"weight"},
+		Endpoint: oauth2.Endpoint{
+			AuthURL:  "https://www.fitbit.com/oauth2/authorize",
+			TokenURL: "https://api.fitbit.com/oauth2/token",
+		},
 	}
 
-	accessToken := &oauth.AccessToken{
-		Token:  *accessTokenToken,
-		Secret: *accessTokenSecret,
-	}
+	c := oauth2.NewClient(
+		context.Background(),
+		oauth2.ReuseTokenSource(nil, &FileTokenSource{
+			Config:    conf,
+			CacheFile: *cachePath,
+			AuthCode: func() string {
+				// Request an access token that expires in 30 days, so that we
+				// have plenty of time to refresh it.
+				authUrl := conf.AuthCodeURL("state", oauth2.AccessTypeOffline, oauth2.SetAuthURLParam("expires_in", "2592000"))
+
+				fmt.Println("Get auth code from:")
+				fmt.Println(authUrl)
+				fmt.Println("Enter auth code (or entire URL):")
+				sc := bufio.NewScanner(os.Stdin)
+				sc.Scan()
+				if u, err := url.Parse(sc.Text()); err == nil {
+					if c := u.Query().Get("code"); c != "" {
+						return c
+					}
+				}
+				return strings.TrimSpace(sc.Text())
+			},
+		}))
 
 	type weight struct {
 		Bmi    float64 `json:"bmi"`
@@ -89,36 +175,10 @@ func main() {
 	var err error
 	for tries < 2 {
 		response, err = c.Get(
-			"https://api.fitbit.com/1/user/-/body/weight/date/today/max.json",
-			map[string]string{},
-			accessToken)
+			"https://api.fitbit.com/1/user/-/body/weight/date/today/max.json")
 		tries += 1
 		if err != nil {
-			// Maybe the accessToken has expired?
-			if tries == 1 && response.StatusCode == 401 {
-				requestToken, url, err := c.GetRequestTokenAndUrl("oob")
-				if err != nil {
-					log.Fatal(err)
-				}
-
-				fmt.Println("(1) Go to: " + url)
-				fmt.Println("(2) Grant access, you should get back a verification code.")
-				fmt.Println("(3) Enter that verification code here: ")
-
-				verificationCode := ""
-				fmt.Scanln(&verificationCode)
-
-				accessToken, err = c.AuthorizeToken(requestToken, verificationCode)
-				if err != nil {
-					log.Fatal(err)
-				}
-
-				log.Printf("Use -access_token_token=%s -access_token_secret=%s\n",
-					accessToken.Token,
-					accessToken.Secret)
-			} else {
-				log.Fatal(err)
-			}
+			log.Fatal(err)
 		}
 	}
 
@@ -150,9 +210,7 @@ func main() {
 			endDate.Format("2006-01-02"))
 
 		response, err := c.Get(
-			requestUrl,
-			map[string]string{},
-			accessToken)
+			requestUrl)
 		if err != nil {
 			log.Fatal(err)
 		}

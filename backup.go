@@ -162,29 +162,22 @@ func main() {
 		}
 	}
 
-	type weight struct {
-		Bmi    float64 `json:"bmi"`
-		Date   string  `json:"date"`
-		Logid  uint    `json:"logid"`
-		Time   string  `json:"time"`
-		Weight float64 `json:"weight"`
+	var timeseries struct {
+		Entries []struct {
+			DateTime string `json:"dateTime"`
+			Value    string `json:"value"`
+		} `json:"body-weight"`
 	}
 
-	type timeSeriesEntry struct {
-		DateTime string `json:"dateTime"`
-		Value    string `json:"value"`
+	var weights struct {
+		Weights []struct {
+			Bmi    float64 `json:"bmi"`
+			Date   string  `json:"date"`
+			Logid  uint    `json:"logid"`
+			Time   string  `json:"time"`
+			Weight float64 `json:"weight"`
+		} `json:"weight"`
 	}
-
-	type timeSeriesReply struct {
-		Entries []timeSeriesEntry `json:"body-weight"`
-	}
-
-	type weightReply struct {
-		Weights []weight `json:"weight"`
-	}
-
-	var timeseries timeSeriesReply
-	var weights weightReply
 
 	// The get-time-series reply lacks the time, it only contains the date.
 	// Also, it returns one entry for each day of the month with the averaged

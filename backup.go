@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -11,11 +10,10 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"strings"
 	"time"
 
-	"golang.org/x/net/context"
 	"golang.org/x/oauth2"
+	"golang.org/x/oauth2/fitbit"
 )
 
 var (
@@ -29,72 +27,101 @@ var (
 		"Path to a JSON-encoded file which will contain the OAuth2 token")
 )
 
-// The following code is intentionally very similar to
-// camlistore.org/pkg/oauthutil, in the hope that it one day is included in the
-// Go standard library…
-
-// ErrNoAuthCode is returned when Token() has not found any valid cached token
-// and TokenSource does not have an AuthCode for getting a new token.
-var ErrNoAuthCode = errors.New("oauthutil: unspecified TokenSource.AuthCode")
-
-type FileTokenSource struct {
-	Config *oauth2.Config
-
-	CacheFile string
-
-	AuthCode func() string
-}
-
 var errExpiredToken = errors.New("expired token")
 
-func cachedToken(cacheFile string) (*oauth2.Token, error) {
-	tok := new(oauth2.Token)
-	tokenData, err := ioutil.ReadFile(cacheFile)
-	if err != nil {
-		return nil, err
-	}
-	if err := json.Unmarshal(tokenData, tok); err != nil {
-		return nil, err
-	}
-	if !tok.Valid() {
-		if tok != nil && time.Now().After(tok.Expiry) {
-			return nil, errExpiredToken
-		}
-		return nil, errors.New("invalid token")
-	}
-	return tok, nil
+type cacherTransport struct {
+	Base *oauth2.Transport
+	Path string
 }
 
-func (src FileTokenSource) Token() (*oauth2.Token, error) {
-	var tok *oauth2.Token
-	var err error
-	if src.CacheFile != "" {
-		tok, err = cachedToken(src.CacheFile)
-		if err == nil {
-			return tok, nil
-		}
-		if err != errExpiredToken {
-			log.Printf("Error getting token from %q: %v\n", src.CacheFile, err)
-		}
+func (c *cacherTransport) RoundTrip(req *http.Request) (resp *http.Response, err error) {
+	cachedToken, err := tokenFromFile(c.Path)
+	if err != nil && !os.IsNotExist(err) {
+		return nil, err
 	}
-	if src.AuthCode == nil {
-		return nil, ErrNoAuthCode
+	if _, err := c.Base.Source.Token(); err != nil {
+		return nil, errExpiredToken
 	}
-	tok, err = src.Config.Exchange(oauth2.NoContext, src.AuthCode())
+	resp, err = c.Base.RoundTrip(req)
 	if err != nil {
-		return nil, fmt.Errorf("could not exchange auth code for a token: %v", err)
+		return nil, err
 	}
-	if src.CacheFile == "" {
-		return tok, nil
-	}
-	tokenData, err := json.Marshal(&tok)
+	newTok, err := c.Base.Source.Token()
 	if err != nil {
-		return nil, fmt.Errorf("could not encode token as json: %v", err)
+		// While we’re unable to obtain a new token, the request was still
+		// successful, so let’s gracefully handle this error by not caching a
+		// new token. In either case, the user will need to re-authenticate.
+		return resp, nil
 	}
-	if err := ioutil.WriteFile(src.CacheFile, tokenData, 0600); err != nil {
-		return nil, fmt.Errorf("could not cache token in %q: %v", src.CacheFile, err)
+	if cachedToken == nil ||
+		cachedToken.AccessToken != newTok.AccessToken ||
+		cachedToken.RefreshToken != newTok.RefreshToken {
+		bytes, err := json.Marshal(&newTok)
+		if err != nil {
+			return nil, err
+		}
+		if err := ioutil.WriteFile(c.Path, bytes, 0600); err != nil {
+			return nil, err
+		}
 	}
-	return tok, nil
+	return resp, nil
+}
+
+func tokenFromFile(path string) (*oauth2.Token, error) {
+	content, err := ioutil.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var t oauth2.Token
+	if err := json.Unmarshal(content, &t); err != nil {
+		return nil, err
+	}
+	return &t, nil
+}
+
+func authorize(conf *oauth2.Config) (*oauth2.Token, error) {
+	tokens := make(chan *oauth2.Token)
+	errors := make(chan error)
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		code := r.FormValue("code")
+		if code == "" {
+			http.Error(w, "Missing 'code' parameter", http.StatusBadRequest)
+			return
+		}
+		tok, err := conf.Exchange(oauth2.NoContext, code)
+		if err != nil {
+			errors <- fmt.Errorf("could not exchange auth code for a token: %v", err)
+			return
+		}
+		tokens <- tok
+	})
+	go func() {
+		// Unfortunately, we need to hard-code this port — when registering
+		// with fitbit, full RedirectURLs need to be whitelisted (incl. port).
+		errors <- http.ListenAndServe(":7319", nil)
+	}()
+
+	authUrl := conf.AuthCodeURL("state", oauth2.AccessTypeOffline)
+	fmt.Println("Please visit the following URL to authorize:")
+	fmt.Println(authUrl)
+	select {
+	case err := <-errors:
+		return nil, err
+	case token := <-tokens:
+		return token, nil
+	}
+}
+
+// Like oauth2.Config.Client(), but using cacherTransport to persist tokens.
+func client(config *oauth2.Config, token *oauth2.Token) *http.Client {
+	return &http.Client{
+		Transport: &cacherTransport{
+			Path: *cachePath,
+			Base: &oauth2.Transport{
+				Source: config.TokenSource(oauth2.NoContext, token),
+			},
+		},
+	}
 }
 
 func main() {
@@ -108,35 +135,32 @@ func main() {
 		ClientID:     "228XTZ",
 		ClientSecret: *clientSecret,
 		Scopes:       []string{"weight"},
-		Endpoint: oauth2.Endpoint{
-			AuthURL:  "https://www.fitbit.com/oauth2/authorize",
-			TokenURL: "https://api.fitbit.com/oauth2/token",
-		},
+		Endpoint:     fitbit.Endpoint,
+		RedirectURL:  "http://localhost:7319/",
 	}
 
-	c := oauth2.NewClient(
-		context.Background(),
-		oauth2.ReuseTokenSource(nil, &FileTokenSource{
-			Config:    conf,
-			CacheFile: *cachePath,
-			AuthCode: func() string {
-				// Request an access token that expires in 30 days, so that we
-				// have plenty of time to refresh it.
-				authUrl := conf.AuthCodeURL("state", oauth2.AccessTypeOffline, oauth2.SetAuthURLParam("expires_in", "2592000"))
+	token, err := tokenFromFile(*cachePath)
+	if err != nil && os.IsNotExist(err) {
+		token, err = authorize(conf)
+	}
+	if err != nil {
+		log.Fatal(err)
+	}
 
-				fmt.Println("Get auth code from:")
-				fmt.Println(authUrl)
-				fmt.Println("Enter auth code (or entire URL):")
-				sc := bufio.NewScanner(os.Stdin)
-				sc.Scan()
-				if u, err := url.Parse(sc.Text()); err == nil {
-					if c := u.Query().Get("code"); c != "" {
-						return c
-					}
-				}
-				return strings.TrimSpace(sc.Text())
-			},
-		}))
+	c := client(conf, token)
+
+	// Send a request just to see if it errors. This quickly detects expired
+	// tokens and allows us to re-authorize.
+	if _, err := c.Get("https://api.fitbit.com/1/user/-/body/weight/date/today/max.json"); err != nil {
+		if urlErr, ok := err.(*url.Error); !ok || urlErr.Err != errExpiredToken {
+			log.Fatal(err)
+		}
+		if token, tokenErr := authorize(conf); tokenErr == nil {
+			c = client(conf, token)
+		} else {
+			log.Fatalf("Request resulted in %v, trying to re-authorize resulted in %v", err, tokenErr)
+		}
+	}
 
 	type weight struct {
 		Bmi    float64 `json:"bmi"`
@@ -172,7 +196,6 @@ func main() {
 	// into the system using the API.
 	tries := 0
 	var response *http.Response
-	var err error
 	for tries < 2 {
 		response, err = c.Get(
 			"https://api.fitbit.com/1/user/-/body/weight/date/today/max.json")

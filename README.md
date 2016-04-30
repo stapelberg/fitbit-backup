@@ -18,7 +18,7 @@ Afterwards, run `$GOPATH/bin/fitbit-backup` to make sure it works (see below
 for configuration). Once you get it to spit out weight data, install a cronjob:
 
 ```
-0 19 * * * /home/michael/gocode/bin/fitbit-backup -access_token_token=replace_this -access_token_secret=replace_this > ~/weight/fitbit-backup-$(date +'\%Y-\%m-\%d')
+0 19 * * * /home/michael/gocode/bin/fitbit-backup -oauth2_cache_path=/home/michael/.fitbit-backup.token.json > ~/weight/fitbit-backup-$(date +'\%Y-\%m-\%d')
 ```
 
 This cronjob will download weight data from Fitbit once a day and store it in a
@@ -33,7 +33,7 @@ https://dev.fitbit.com/apps/new and fill in the form like in this example:
 
 <img
 src="https://github.com/stapelberg/fitbit-backup/raw/master/fitbit_app_registration.png"
-width="800" alt="fitbit app registration screenshot">
+width="795" alt="fitbit app registration screenshot">
 
 Afterwards, fitbit will present you the “Client (Consumer) Secret” for the
 newly created application. Specify that using the flag `-oauth2_client_secret`.
